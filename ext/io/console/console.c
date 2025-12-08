@@ -1372,7 +1372,7 @@ console_goto_column(VALUE io, VALUE val)
     if (!GetConsoleScreenBufferInfo(h, &ws)) {
 	rb_syserr_fail(LAST_ERROR, 0);
     }
-    pos->X = NUM2INT(val);
+    pos->X = NUM2UINT(val);
     if (!SetConsoleCursorPosition(h, *pos)) {
 	rb_syserr_fail(LAST_ERROR, 0);
     }
