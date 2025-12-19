@@ -4,7 +4,7 @@
  */
 
 static const char *const
-IO_CONSOLE_VERSION = "0.8.2";
+IO_CONSOLE_VERSION = "0.8.2dev";
 
 #include "ruby.h"
 #include "ruby/io.h"
@@ -54,7 +54,13 @@ typedef struct sgttyb conmode;
 #elif defined _WIN32
 #include <winioctl.h>
 #include <conio.h>
-typedef DWORD conmode;
+//typedef DWORD conmode;
+typedef struct {
+    DWORD mode;
+    DWORD handle_property;
+} conmode;
+#define INPUT_P(conmode) ((conmode)->handle_property & 1)
+#define SUPPORT_VT_P(conmode) ((conmode)->handle_property & 2)
 
 #define LAST_ERROR rb_w32_map_errno(GetLastError())
 #define SET_LAST_ERROR (errno = LAST_ERROR, 0)
@@ -62,7 +68,7 @@ typedef DWORD conmode;
 static int
 setattr(int fd, conmode *t)
 {
-    int x = SetConsoleMode((HANDLE)rb_w32_get_osfhandle(fd), *t);
+    int x = SetConsoleMode((HANDLE)rb_w32_get_osfhandle(fd), t->mode);
     if (!x) errno = LAST_ERROR;
     return x;
 }
@@ -70,8 +76,22 @@ setattr(int fd, conmode *t)
 static int
 getattr(int fd, conmode *t)
 {
-    int x = GetConsoleMode((HANDLE)rb_w32_get_osfhandle(fd), t);
+    HANDLE h = (HANDLE)rb_w32_get_osfhandle(fd);
+    int x = GetConsoleMode(h, &(t->mode));
     if (!x) errno = LAST_ERROR;
+    else {
+        DWORD dummy;
+        t->handle_property = GetNumberOfConsoleInputEvents(h, &dummy) != 0 ? 1 : 0;
+        if (INPUT_P(t)) {
+            if (x & ENABLE_VIRTUAL_TERMINAL_INPUT) {
+                t->handle_property |= 2;
+            }
+            else if (0 != SetConsoleMode(h, x | ENABLE_VIRTUAL_TERMINAL_INPUT)) {
+                t->handle_property |= 2;
+                SetConsoleMode(h, x);
+            }
+        }
+    }
     return x;
 }
 #endif
@@ -261,7 +281,12 @@ set_rawmode(conmode *t, void *arg)
     t->sg_flags &= ~ECHO;
     t->sg_flags |= RAW;
 #elif defined _WIN32
-    *t = 0;
+    if (INPUT_P(t)) {
+        t->mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+        if (SUPPORT_VT_P(t)) {
+            t->mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+        }
+    }
 #endif
     if (arg) {
 	const rawmode_arg_t *r = arg;
@@ -278,6 +303,13 @@ set_rawmode(conmode *t, void *arg)
 	    t->c_oflag |= OPOST;
 	}
 #endif
+#ifdef _WIN32
+        if (INPUT_P(t)) {
+            if (!r->intr) {
+                t->mode &= ~ENABLE_PROCESSED_INPUT;
+            }
+        }
+#endif
 	(void)r;
     }
 }
@@ -293,7 +325,9 @@ set_cookedmode(conmode *t, void *arg)
     t->sg_flags |= ECHO;
     t->sg_flags &= ~RAW;
 #elif defined _WIN32
-    *t |= ENABLE_ECHO_INPUT|ENABLE_LINE_INPUT|ENABLE_PROCESSED_INPUT;
+    if (INPUT_P(t)) {
+        t->mode |= ENABLE_ECHO_INPUT|ENABLE_LINE_INPUT|ENABLE_PROCESSED_INPUT;
+    }
 #endif
 }
 
@@ -305,7 +339,9 @@ set_noecho(conmode *t, void *arg)
 #elif defined HAVE_SGTTY_H
     t->sg_flags &= ~ECHO;
 #elif defined _WIN32
-    *t &= ~ENABLE_ECHO_INPUT;
+    if (INPUT_P(t)) {
+        t->mode &= ~ENABLE_ECHO_INPUT;
+    }
 #endif
 }
 
@@ -317,7 +353,9 @@ set_echo(conmode *t, void *arg)
 #elif defined HAVE_SGTTY_H
     t->sg_flags |= ECHO;
 #elif defined _WIN32
-    *t |= ENABLE_ECHO_INPUT;
+    if (INPUT_P(t)) {
+        t->mode |= ENABLE_ECHO_INPUT;
+    }
 #endif
 }
 
@@ -329,7 +367,7 @@ echo_p(conmode *t)
 #elif defined HAVE_SGTTY_H
     return (t->sg_flags & ECHO) != 0;
 #elif defined _WIN32
-    return (*t & ENABLE_ECHO_INPUT) != 0;
+    return (t->mode & ENABLE_ECHO_INPUT) != 0;
 #endif
 }
 
@@ -1930,6 +1968,95 @@ console_ttyname(VALUE io)
 # define console_ttyname rb_f_notimplement
 #endif
 
+#if defined(_WIN32)
+
+static VALUE
+call_sysseek_func(VALUE io)
+{
+    return rb_funcall(io, rb_intern("sysseek"), 1, INT2FIX(0));
+}
+
+static int
+parse_key_event_record(KEY_EVENT_RECORD *ker)
+{
+    
+}
+
+/*
+ *  call-seq:
+ *    getbyte -> integer or nil
+ *
+ *  Reads and returns the next byte (in range 0..255) from the stream;
+ *  returns +nil+ if already at end-of-stream.
+ *  See {Byte IO}[rdoc-ref:IO@Byte+IO].
+ *
+ *    f = File.open('t.txt')
+ *    f.getbyte # => 70
+ *    f.close
+ *    f = File.open('t.rus')
+ *    f.getbyte # => 209
+ *    f.close
+ *
+ *  Related: IO#readbyte (may raise EOFError).
+ */
+
+static VALUE
+console_getbyte(VALUE io)
+{
+    rb_io_t *fptr;
+    int fd;
+    DWORD mode;
+    int status = 0;
+
+    fd = GetReadFD(io);
+    SOCKET sock = (SOCKET)_get_osfhandle(fd);
+    if (rb_w32_is_socket(sock) || !GetConsoleMode((HANDLE)sock, &mode) ||
+        0 != (mode & ENABLE_LINE_INPUT)) {
+        rb_call_super(0, 0);
+    }
+    rb_protect(call_sysseek_func, io, &status);
+    if (status) {
+        /* may be "sysseek for buffered IO" : data exists in buffer */
+        rb_set_errinfo(Qnil);
+        rb_call_super(0, 0);
+    }
+    if (mode & ENABLE_VIRTUAL_TERMINAL_INPUT) {
+        /* use ReadConsoleW */
+    } else {
+        /* use ReadConsoleInputW */
+        INPUT_RECORD input_record;
+    }
+}
+
+/*
+ * call-seq:
+ *   io.wait_readable          -> truthy or falsy
+ *   io.wait_readable(timeout) -> truthy or falsy
+ *
+ * Waits until IO is readable and returns a truthy value, or a falsy
+ * value when times out.  Returns a truthy value immediately when
+ * buffered data is available.
+ */
+
+static VALUE
+console_wait_readable(int argc, VALUE *argv, VALUE io)
+{
+/*
+    rb_io_t *fptr;
+
+    RB_IO_POINTER(io, fptr);
+    rb_io_check_char_readable(fptr);
+
+    if (rb_io_read_pending(fptr)) return Qtrue;
+
+    rb_check_arity(argc, 0, 1);
+    VALUE timeout = (argc == 1 ? argv[0] : Qnil);
+
+    return io_wait_event(io, RUBY_IO_READABLE, timeout, 1);
+*/  return Qnil;
+}
+#endif
+
 /*
  * IO console methods
  */
@@ -2005,6 +2132,16 @@ InitVM_console(void)
 	rb_define_method(mReadable, "getch", io_getch, -1);
 	rb_define_method(mReadable, "getpass", io_getpass, -1);
     }
+#ifdef _WIN32
+    {
+	/* :stopdoc: */
+        VALUE mConsoleReadable = rb_define_module_under(rb_cIO, "console_readable");
+	/* :startdoc: */
+        //rb_define_method(mConsoleReadable, "getbyte", console_getbyte, 0);
+        //rb_define_method(mConsoleReadable, "wait_readable", console_wait_readable, -1);
+        rb_prepend_module(rb_cIO, mConsoleReadable);
+    }
+#endif
     {
 	/* :nodoc: */
         cConmode = rb_define_class_under(rb_cIO, "ConsoleMode", rb_cObject);
