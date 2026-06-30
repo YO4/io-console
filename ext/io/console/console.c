@@ -1976,11 +1976,193 @@ call_sysseek_func(VALUE io)
     return rb_funcall(io, rb_intern("sysseek"), 1, INT2FIX(0));
 }
 
+#ifndef CONSOLE_READ_NOREMOVE
+#define CONSOLE_READ_NOREMOVE   0x0001
+#endif
+
+#ifndef CONSOLE_READ_NOWAIT
+#define CONSOLE_READ_NOWAIT     0x0002
+#endif
+
+typedef BOOL (WINAPI * ReadConsoleInputExW_t)(
+    _In_ HANDLE hConsoleInput,
+    _Out_writes_(nLength) PINPUT_RECORD lpBuffer,
+    _In_ DWORD nLength,
+    _Out_ LPDWORD lpNumberOfEventsRead,
+    _In_ USHORT wFlags);
+
+static ReadConsoleInputExW_t pReadConsoleInputExW = NULL;
+
 static int
 parse_key_event_record(KEY_EVENT_RECORD *ker)
 {
     
 }
+
+#define modALT   (RIGHT_ALT_PRESSED | LEFT_ALT_PRESSED)
+#define modCTRL  (RIGHT_CTRL_PRESSED | LEFT_CTRL_PRESSED)
+#define modSHIFT (SHIFT_PRESSED)
+#define modAltGr (RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED)
+
+long console_getbyte_raw(HANDLE hConsole)
+{
+    static unsigned char pending_sequence[16];
+    static long pending_count = 0;
+    long ret = 0;
+    long esc = 0;
+    INPUT_RECORD ir;
+    DWORD nread = 0;
+    DWORD mod = 0;
+    unsigned char *intro = NULL;
+    unsigned char *lead = NULL;
+    unsigned char *trail = NULL;
+
+    if (pending_count) {
+        ret = pending_sequence[0];
+        pending_count--;
+        for (int i = 0; i < pending_count; i++) pending_sequence[i] = pending_sequence[i + 1];
+        return ret;
+    }
+
+    if (!pReadConsoleInputExW) {
+        HANDLE kernel32 = LoadLibrary("kernel32.dll");
+        if (!kernel32) return -1;
+        pReadConsoleInputExW =
+            (ReadConsoleInputExW_t)GetProcAddress(kernel32, "ReadConsoleInputW");
+        if (!pReadConsoleInputExW) return -1;
+    }
+
+    do {
+        if (pReadConsoleInputExW(hConsole, &ir, 1, &nread, CONSOLE_READ_NOWAIT) && nread) {
+            if (ir.EventType == KEY_EVENT) {
+                if (ir.Event.KeyEvent.bKeyDown) {
+                    ret = ir.Event.KeyEvent.uChar.UnicodeChar;
+                    mod = ir.Event.KeyEvent.dwControlKeyState;
+                    if ((mod & modAltGr) == modAltGr) mod &= ~modAltGr;
+                    if (ret) {
+                        if (mod & modALT) esc = '\033';
+                        if (ret == 32 && (mod & modCTRL)) {
+                          ret = 0; /* ctrl-SPACE */
+                          break;
+                        }
+                        if (ret == '\t' && (mod & modSHIFT) && !(mod & modCTRL)) {
+                            esc = 0;
+                            mod = 0;
+                            intro = "\033[";
+                            trail = "Z";
+                        }
+                    }
+                    else {
+                        switch (ir.Event.KeyEvent.wVirtualKeyCode) {
+                        case (VK_UP):
+                        case (VK_NUMPAD7):
+                            intro = "\033["; lead = NULL; trail = "A"; break;
+                        case (VK_DOWN):
+                        case (VK_NUMPAD2):
+                            intro = "\033["; lead = NULL; trail = "B"; break;
+                        case (VK_RIGHT):
+                        case (VK_NUMPAD6):
+                            intro = "\033["; lead = NULL; trail = "C"; break;
+                        case (VK_LEFT):
+                        case (VK_NUMPAD4):
+                            intro = "\033["; lead = NULL; trail = "D"; break;
+                        case (VK_CLEAR):
+                        case (VK_NUMPAD5):
+                            intro = "\033["; lead = NULL; trail = "G"; break;
+                        case (VK_HOME):
+                        case (VK_NUMPAD8):
+                            intro = "\033["; lead = "1";  trail = "~"; break;
+                        case (VK_INSERT):
+                        case (VK_NUMPAD0):
+                            intro = "\033["; lead = "2";  trail = "~"; break;
+                        case (VK_DELETE):
+                        case (VK_DECIMAL):
+                            intro = "\033["; lead = "2";  trail = "~"; break;
+                        case (VK_END):
+                        case (VK_NUMPAD1):
+                            intro = "\033["; lead = "4";  trail = "~"; break;
+                        case (VK_PRIOR):
+                        case (VK_NUMPAD9):
+                            intro = "\033["; lead = "5";  trail = "~"; break;
+                        case (VK_NEXT):
+                        case (VK_NUMPAD3):
+                            intro = "\033["; lead = "6";  trail = "~"; break;
+                        case (VK_F1):
+                            intro = "\033O"; lead = NULL; trail = "P"; break;
+                        case (VK_F2):
+                            intro = "\033O"; lead = NULL; trail = "Q"; break;
+                        case (VK_F3):
+                            intro = "\033O"; lead = NULL; trail = "R"; break;
+                        case (VK_F4):
+                            intro = "\033O"; lead = NULL; trail = "S"; break;
+                        case (VK_F5):
+                            intro = "\033["; lead = "15"; trail = "~"; break;
+                        case (VK_F6):
+                            intro = "\033["; lead = "17"; trail = "~"; break;
+                        case (VK_F7):
+                            intro = "\033["; lead = "18"; trail = "~"; break;
+                        case (VK_F8):
+                            intro = "\033["; lead = "19"; trail = "~"; break;
+                        case (VK_F9):
+                            intro = "\033["; lead = "20"; trail = "~"; break;
+                        case (VK_F10):
+                            intro = "\033["; lead = "21"; trail = "~"; break;
+                        case (VK_F11):
+                            intro = "\033["; lead = "23"; trail = "~"; break;
+                        case (VK_F12):
+                            intro = "\033["; lead = "24"; trail = "~"; break;
+                        }
+                    }
+                }
+                else if (ir.Event.KeyEvent.wVirtualKeyCode == VK_MENU /* ALT key */ &&
+                    ir.Event.KeyEvent.uChar.UnicodeChar) {
+                    /* !ir.Event.KeyEvent.bKeyDown */
+                    ret = ir.Event.KeyEvent.uChar.UnicodeChar;
+                    break;
+                }
+            }
+        }
+    } while (ret == 0 && !intro);
+  out:
+    if (esc) {
+        pending_sequence[0] = ret;
+        pending_count = 1;
+        ret = esc;
+    }
+    if (intro) {
+        if (mod & (modSHIFT | modCTRL | modALT)) {
+            mod = ((mod & modSHIFT) ? 1 : 0) |
+                  ((mod & modALT) ? 2 : 0) |
+                  ((mod & modCTRL) ? 4 : 0);
+            if (!lead) {
+                lead = "1";
+                intro = "\033[";
+            }
+        }
+        else {
+            mod = 0;
+        }
+        ret = intro[0];
+        strcpy(pending_sequence, intro + 1);
+        if (lead)
+            strcat(pending_sequence, lead);
+        if (mod) {
+            switch (mod) {
+            case 1: strcat(pending_sequence, ";2"); break;
+            case 2: strcat(pending_sequence, ";3"); break;
+            case 3: strcat(pending_sequence, ";4"); break;
+            case 4: strcat(pending_sequence, ";5"); break;
+            case 5: strcat(pending_sequence, ";6"); break;
+            case 6: strcat(pending_sequence, ";7"); break;
+            case 7: strcat(pending_sequence, ";8"); break;
+            }
+        }
+        strcat(pending_sequence, trail);
+        pending_count = strlen(pending_sequence);
+    }
+    return ret;
+}
+
 
 /*
  *  call-seq:
@@ -2007,25 +2189,72 @@ console_getbyte(VALUE io)
     int fd;
     DWORD mode;
     int status = 0;
+    long codepoint = 0;
+    static long pending_codepoint = 0;
+
+    if (!RB_TYPE_P(io, T_FILE)) goto super;
 
     fd = GetReadFD(io);
     SOCKET sock = (SOCKET)_get_osfhandle(fd);
-    if (rb_w32_is_socket(sock) || !GetConsoleMode((HANDLE)sock, &mode) ||
-        0 != (mode & ENABLE_LINE_INPUT)) {
-        rb_call_super(0, 0);
+    if (rb_w32_is_socket(sock)) goto super;
+
+    if (!GetConsoleMode((HANDLE)sock, &mode) || (mode & ENABLE_LINE_INPUT)) {
+        goto super;
     }
     rb_protect(call_sysseek_func, io, &status);
     if (status) {
         /* may be "sysseek for buffered IO" : data exists in buffer */
         rb_set_errinfo(Qnil);
-        rb_call_super(0, 0);
+        goto super;
+    }
+
+    if (pending_codepoint) {
+        codepoint = pending_codepoint;
+        pending_codepoint = 0;
     }
     if (mode & ENABLE_VIRTUAL_TERMINAL_INPUT) {
         /* use ReadConsoleW */
+        DWORD nread = 0;
+        WORD buf;
+
+        if (!codepoint) {
+            ReadConsoleW((HANDLE)_get_osfhandle(fd), &buf, 1, &nread, NULL);
+        } else nread = 1;
+        if (nread) {
+            codepoint = buf;
+            if (0xd800 <= buf && buf <= 0xdbff) {
+                if (ReadConsoleW((HANDLE)_get_osfhandle(fd), &buf, 1, &nread, NULL) &&
+                    nread && (0xdc00 <= buf && buf <= 0xdfff)) {
+                    codepoint = 0x10000 + (codepoint - 0xd800) * 0x400 + buf;
+                } else {
+                    if (nread > 0) pending_codepoint = buf;
+                    codepoint = 0xfffd;
+                }
+            }
+        } else {
+            return Qnil;
+        }
     } else {
         /* use ReadConsoleInputW */
-        INPUT_RECORD input_record;
+        long buf;
+        if (!codepoint) {
+            buf = console_getbyte_raw((HANDLE)_get_osfhandle(fd));
+        }
+        codepoint = buf;
+        if (0xd800 <= buf && buf <= 0xdbff) {
+            buf = console_getbyte_raw((HANDLE)_get_osfhandle(fd));
+            if (0xdc00 <= buf && buf <= 0xdfff) {
+                codepoint = 0x10000 + (codepoint - 0xd800) * 0x400 + buf;
+            } else {
+                pending_codepoint = buf;
+                codepoint = 0xfffd;
+            }
+        }
     }
+    return LONG2FIX(codepoint);
+
+  super:
+    return rb_call_super(0, 0);
 }
 
 /*
@@ -2137,7 +2366,7 @@ InitVM_console(void)
 	/* :stopdoc: */
         VALUE mConsoleReadable = rb_define_module_under(rb_cIO, "console_readable");
 	/* :startdoc: */
-        //rb_define_method(mConsoleReadable, "getbyte", console_getbyte, 0);
+        rb_define_method(mConsoleReadable, "getbyte", console_getbyte, 0);
         //rb_define_method(mConsoleReadable, "wait_readable", console_wait_readable, -1);
         rb_prepend_module(rb_cIO, mConsoleReadable);
     }
